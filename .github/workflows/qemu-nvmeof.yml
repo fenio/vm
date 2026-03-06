@@ -23,6 +23,11 @@ jobs:
           modprobe nvme-tcp 2>&1 || true
           lsmod | grep nvme || echo "No nvme modules loaded"
 
+      - name: Enable KVM access
+        run: |
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+
       - name: Install QEMU and dependencies
         run: |
           sudo apt-get update -qq
@@ -40,25 +45,20 @@ jobs:
           password: test1234
           chpasswd: { expire: False }
           ssh_pwauth: True
-          packages:
-            - nvme-cli
-            - linux-modules-extra-$(uname -r)
           runcmd:
+            - apt-get update -qq && apt-get install -y -qq nvme-cli linux-modules-extra-$(uname -r)
             - modprobe nvme-tcp
             - modprobe nvmet
             - modprobe nvmet-tcp
             - echo "=== NVMe modules ===" > /dev/ttyS0
             - lsmod | grep nvme > /dev/ttyS0 2>&1
             - echo "=== Creating NVMe-oF loopback target ===" > /dev/ttyS0
-            # Create a backing file for the NVMe namespace
             - truncate -s 100M /tmp/nvme-target.img
-            # Configure NVMe-oF target
             - mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys
             - echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/attr_allow_any_host
             - mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1
             - echo "/tmp/nvme-target.img" > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/device_path
             - echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/enable
-            # Create TCP port
             - mkdir -p /sys/kernel/config/nvmet/ports/1
             - echo 127.0.0.1 > /sys/kernel/config/nvmet/ports/1/addr_traddr
             - echo 4420 > /sys/kernel/config/nvmet/ports/1/addr_trsvcid
@@ -66,14 +66,12 @@ jobs:
             - echo ipv4 > /sys/kernel/config/nvmet/ports/1/addr_adrfam
             - ln -s /sys/kernel/config/nvmet/subsystems/test-subsys /sys/kernel/config/nvmet/ports/1/subsystems/test-subsys
             - echo "=== Target configured ===" > /dev/ttyS0
-            # Discover and connect as initiator
             - nvme discover -t tcp -a 127.0.0.1 -s 4420 > /dev/ttyS0 2>&1
             - nvme connect -t tcp -n test-subsys -a 127.0.0.1 -s 4420 > /dev/ttyS0 2>&1
             - sleep 2
             - echo "=== NVMe devices ===" > /dev/ttyS0
             - nvme list > /dev/ttyS0 2>&1
             - lsblk > /dev/ttyS0 2>&1
-            # Try to create filesystem and mount
             - mkfs.ext4 -F /dev/nvme0n1 > /dev/ttyS0 2>&1
             - mkdir -p /mnt/nvme
             - mount /dev/nvme0n1 /mnt/nvme > /dev/ttyS0 2>&1

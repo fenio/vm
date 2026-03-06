@@ -18,9 +18,42 @@ jobs:
           echo "=== Kernel ==="
           uname -r
 
+      - name: Enable KVM access
+        run: |
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+
       - name: Install smolvm
         run: |
-          curl -sSL https://smolmachines.com/install.sh | bash
+          sudo chmod 666 /dev/kvm
+          curl -sSL https://smolmachines.com/install.sh | bash || {
+            echo "Official installer failed (no Linux release yet), building from source..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq docker.io
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            git clone https://github.com/smol-machines/smolvm.git /tmp/smolvm
+            cd /tmp/smolvm
+            git lfs pull
+            LIBKRUN_BUNDLE=./lib/linux-x86_64 cargo build --release --bin smolvm
+            mkdir -p "$HOME/.smolvm/bin"
+            cp target/release/smolvm "$HOME/.smolvm/bin/smolvm-bin"
+            # Create wrapper script
+            cat > "$HOME/.smolvm/bin/smolvm" <<'WRAPPER'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          SMOLVM_ROOT="$(dirname "$SCRIPT_DIR")"
+          export LD_LIBRARY_PATH="$SMOLVM_ROOT/lib:${LD_LIBRARY_PATH:-}"
+          exec "$SCRIPT_DIR/smolvm-bin" "$@"
+          WRAPPER
+            chmod +x "$HOME/.smolvm/bin/smolvm"
+            # Copy libraries
+            mkdir -p "$HOME/.smolvm/lib"
+            cp ./lib/linux-x86_64/libkrun.so* "$HOME/.smolvm/lib/"
+            cp ./lib/linux-x86_64/libkrunfw.so* "$HOME/.smolvm/lib/"
+            # Build and install agent rootfs
+            ./scripts/build-agent-rootfs.sh --install
+          }
           echo "$HOME/.smolvm/bin" >> $GITHUB_PATH
 
       - name: Verify smolvm works
