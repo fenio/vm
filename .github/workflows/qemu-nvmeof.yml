@@ -24,12 +24,17 @@ jobs:
       - name: Install QEMU and dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils wget
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils wget libguestfs-tools
 
-      - name: Download cloud image
+      - name: Download and prepare cloud image
         run: |
           wget -q https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
           qemu-img resize ubuntu-24.04-server-cloudimg-amd64.img 8G
+
+          # Pre-install nvme-cli into the image to avoid slow apt-get inside VM
+          sudo virt-customize -a ubuntu-24.04-server-cloudimg-amd64.img \
+            --install nvme-cli \
+            --run-command 'apt-get clean'
 
       - name: Create test script and cloud-init
         run: |
@@ -37,10 +42,6 @@ jobs:
           #!/bin/bash
           set -ex
           exec > /dev/ttyS0 2>&1
-
-          echo "=== Installing nvme-cli ==="
-          apt-get update -qq
-          apt-get install -y -qq nvme-cli
 
           echo "=== Loading NVMe modules ==="
           modprobe configfs
@@ -94,9 +95,9 @@ jobs:
           echo "DONE"
           SCRIPT
 
-          # Generate user-data with Python, embedding base64 script with write_files
+          # Generate cloud-init user-data with Python to avoid YAML/heredoc issues
           python3 << 'PYEOF'
-          import base64, yaml, sys
+          import base64, yaml
 
           with open('test-nvmeof.sh', 'rb') as f:
               b64 = base64.b64encode(f.read()).decode()
@@ -120,8 +121,8 @@ jobs:
               yaml.dump(config, f, default_flow_style=False, width=4096)
           PYEOF
 
-          echo "=== Generated user-data (first 20 lines) ==="
-          head -20 user-data
+          echo "=== Generated user-data (first 10 lines) ==="
+          head -10 user-data
           echo "==========================="
 
           cloud-localds seed.img user-data
