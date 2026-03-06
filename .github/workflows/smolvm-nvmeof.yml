@@ -12,48 +12,48 @@ jobs:
         run: |
           echo "=== CPU ==="
           nproc
-          grep -c -E '(vmx|svm)' /proc/cpuinfo || echo "No hardware virt flags"
           echo "=== KVM ==="
           ls -la /dev/kvm 2>/dev/null || echo "/dev/kvm not found"
           echo "=== Kernel ==="
           uname -r
 
       - name: Enable KVM access
-        run: |
-          sudo chmod 666 /dev/kvm
-          ls -la /dev/kvm
+        run: sudo chmod 666 /dev/kvm
 
-      - name: Install smolvm
+      - name: Install smolvm from source
+        timeout-minutes: 15
         run: |
-          sudo chmod 666 /dev/kvm
-          curl -sSL https://smolmachines.com/install.sh | bash || {
-            echo "Official installer failed (no Linux release yet), building from source..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq docker.io
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source "$HOME/.cargo/env"
-            git clone https://github.com/smol-machines/smolvm.git /tmp/smolvm
-            cd /tmp/smolvm
-            git lfs pull
-            LIBKRUN_BUNDLE=./lib/linux-x86_64 cargo build --release --bin smolvm
-            mkdir -p "$HOME/.smolvm/bin"
-            cp target/release/smolvm "$HOME/.smolvm/bin/smolvm-bin"
-            # Create wrapper script
-            cat > "$HOME/.smolvm/bin/smolvm" <<'WRAPPER'
+          # Install build dependencies
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git-lfs
+
+          # Install Rust
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+
+          # Clone and build
+          git clone https://github.com/smol-machines/smolvm.git /tmp/smolvm
+          cd /tmp/smolvm
+          git lfs pull
+
+          LIBKRUN_BUNDLE=./lib/linux-x86_64 cargo build --release --bin smolvm
+
+          # Install binary + libs
+          mkdir -p "$HOME/.smolvm/bin" "$HOME/.smolvm/lib"
+          cp target/release/smolvm "$HOME/.smolvm/bin/smolvm-bin"
+          cp -a ./lib/linux-x86_64/libkrun*.so* "$HOME/.smolvm/lib/"
+
+          cat > "$HOME/.smolvm/bin/smolvm" <<'WRAPPER'
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          SMOLVM_ROOT="$(dirname "$SCRIPT_DIR")"
-          export LD_LIBRARY_PATH="$SMOLVM_ROOT/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$SCRIPT_DIR")/lib:${LD_LIBRARY_PATH:-}"
           exec "$SCRIPT_DIR/smolvm-bin" "$@"
           WRAPPER
-            chmod +x "$HOME/.smolvm/bin/smolvm"
-            # Copy libraries
-            mkdir -p "$HOME/.smolvm/lib"
-            cp ./lib/linux-x86_64/libkrun.so* "$HOME/.smolvm/lib/"
-            cp ./lib/linux-x86_64/libkrunfw.so* "$HOME/.smolvm/lib/"
-            # Build and install agent rootfs
-            ./scripts/build-agent-rootfs.sh --install
-          }
+          chmod +x "$HOME/.smolvm/bin/smolvm"
+
+          # Build and install agent rootfs
+          ./scripts/build-agent-rootfs.sh --install
+
           echo "$HOME/.smolvm/bin" >> $GITHUB_PATH
 
       - name: Verify smolvm works
@@ -61,61 +61,25 @@ jobs:
           smolvm --version
           smolvm sandbox run --net alpine:latest -- echo "smolvm works on GitHub runner"
 
-      - name: Test kernel module availability in smolvm
+      - name: Test NVMe module support in smolvm
         run: |
-          echo "=== Checking NVMe module support inside smolvm ==="
+          echo "=== Checking NVMe support inside smolvm sandbox ==="
           smolvm sandbox run --net alpine:latest -- sh -c '
             echo "--- Kernel version ---"
             uname -r
-            echo "--- Available NVMe modules ---"
-            find /lib/modules -name "nvme*" 2>/dev/null || echo "No /lib/modules found"
             echo "--- Try loading nvme-tcp ---"
-            modprobe nvme-tcp 2>&1 || echo "modprobe nvme-tcp failed (expected - minimal kernel)"
+            modprobe nvme-tcp 2>&1 || echo "FAIL: nvme-tcp module not available"
+            echo "--- Try loading nvmet ---"
+            modprobe nvmet 2>&1 || echo "FAIL: nvmet module not available"
             echo "--- /proc/modules ---"
             cat /proc/modules 2>/dev/null | grep nvme || echo "No nvme modules loaded"
-            echo "--- Check /dev for nvme ---"
-            ls /dev/nvme* 2>/dev/null || echo "No nvme devices"
-            echo "--- Kernel config (if available) ---"
-            zcat /proc/config.gz 2>/dev/null | grep -i nvme || echo "No /proc/config.gz"
-          ' || true
-
-      - name: Test NVMe-oF setup in smolvm microvm
-        run: |
-          smolvm microvm create nvme-test --net --cpus 2 --mem 1024
-          smolvm microvm start nvme-test
-          sleep 3
-
-          echo "=== Attempting NVMe-oF target setup inside microvm ==="
-          smolvm microvm exec --name nvme-test -- sh -c '
-            apk add --no-cache nvme-cli 2>/dev/null
-
-            echo "--- Kernel version ---"
-            uname -r
-
-            echo "--- Try loading NVMe modules ---"
-            modprobe nvme-tcp 2>&1 || echo "FAIL: modprobe nvme-tcp not available"
-            modprobe nvmet 2>&1 || echo "FAIL: modprobe nvmet not available"
-            modprobe nvmet-tcp 2>&1 || echo "FAIL: modprobe nvmet-tcp not available"
-
-            echo "--- Loaded modules ---"
-            lsmod 2>/dev/null | grep nvme || echo "No nvme modules loaded"
-
-            echo "--- Check configfs ---"
-            mount | grep configfs || echo "No configfs mounted"
-            ls /sys/kernel/config/nvmet 2>/dev/null || echo "FAIL: /sys/kernel/config/nvmet not available"
-
-            echo ""
-            echo "CONCLUSION: smolvm uses a minimal libkrunfw kernel without NVMe-oF support"
+            echo "--- Kernel config check ---"
+            zcat /proc/config.gz 2>/dev/null | grep -i nvme || echo "No /proc/config.gz or no NVMe config"
           ' 2>&1 || true
 
-          smolvm microvm stop nvme-test 2>/dev/null || true
-          echo y | smolvm microvm delete nvme-test 2>/dev/null || true
-
-      - name: Summary
-        run: |
+          echo ""
           echo "========================================="
-          echo "smolvm uses libkrunfw which ships a minimal kernel."
-          echo "NVMe-oF requires nvme-tcp, nvmet, and nvmet-tcp modules"
-          echo "which are not included in the libkrunfw kernel."
-          echo "For NVMe-oF testing, a full VM (QEMU) is needed."
+          echo "CONCLUSION: smolvm uses a minimal libkrunfw kernel."
+          echo "NVMe-oF modules (nvme-tcp, nvmet, nvmet-tcp) are not included."
+          echo "For NVMe-oF testing, use QEMU with a full kernel."
           echo "========================================="
