@@ -33,7 +33,6 @@ jobs:
 
       - name: Create test script and cloud-init
         run: |
-          # Write the test script separately to avoid YAML escaping issues
           cat > test-nvmeof.sh <<'SCRIPT'
           #!/bin/bash
           set -ex
@@ -95,27 +94,34 @@ jobs:
           echo "DONE"
           SCRIPT
 
-          # Encode script as base64 for safe embedding in cloud-init
-          B64_SCRIPT=$(base64 -w0 test-nvmeof.sh)
+          # Generate user-data with Python, embedding base64 script with write_files
+          python3 << 'PYEOF'
+          import base64, yaml, sys
 
-          # Write cloud-init user-data with proper YAML (no leading whitespace)
-          python3 -c "
-          import yaml, sys
+          with open('test-nvmeof.sh', 'rb') as f:
+              b64 = base64.b64encode(f.read()).decode()
+
           config = {
               'password': 'test1234',
               'chpasswd': {'expire': False},
+              'write_files': [{
+                  'path': '/root/test-nvmeof.sh',
+                  'permissions': '0755',
+                  'encoding': 'b64',
+                  'content': b64,
+              }],
               'runcmd': [
-                  'echo $B64_SCRIPT | base64 -d > /root/test-nvmeof.sh',
-                  'chmod +x /root/test-nvmeof.sh',
                   '/root/test-nvmeof.sh',
               ]
           }
-          sys.stdout.write('#cloud-config\n')
-          yaml.dump(config, sys.stdout, default_flow_style=False)
-          " > user-data
 
-          echo "=== Generated user-data ==="
-          cat user-data
+          with open('user-data', 'w') as f:
+              f.write('#cloud-config\n')
+              yaml.dump(config, f, default_flow_style=False, width=4096)
+          PYEOF
+
+          echo "=== Generated user-data (first 20 lines) ==="
+          head -20 user-data
           echo "==========================="
 
           cloud-localds seed.img user-data
