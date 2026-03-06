@@ -24,17 +24,12 @@ jobs:
       - name: Install QEMU and dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils wget libguestfs-tools
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils wget
 
-      - name: Download and prepare cloud image
+      - name: Download cloud image
         run: |
           wget -q https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
           qemu-img resize ubuntu-24.04-server-cloudimg-amd64.img 8G
-
-          # Pre-install nvme-cli into the image to avoid slow apt-get inside VM
-          sudo virt-customize -a ubuntu-24.04-server-cloudimg-amd64.img \
-            --install nvme-cli \
-            --run-command 'apt-get clean'
 
       - name: Create test script and cloud-init
         run: |
@@ -42,6 +37,10 @@ jobs:
           #!/bin/bash
           set -ex
           exec > /dev/ttyS0 2>&1
+
+          echo "=== Installing nvme-cli ==="
+          which nvme || (apt-get update -qq && apt-get install -y -qq nvme-cli)
+          echo "=== nvme-cli ready ==="
 
           echo "=== Loading NVMe modules ==="
           modprobe configfs
@@ -112,7 +111,7 @@ jobs:
                   'content': b64,
               }],
               'runcmd': [
-                  '/root/test-nvmeof.sh',
+                  'nohup /root/test-nvmeof.sh &',
               ]
           }
 
