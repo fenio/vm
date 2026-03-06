@@ -10,20 +10,16 @@ jobs:
     steps:
       - name: System info
         run: |
-          echo "=== CPU ==="
-          nproc
+          echo "=== CPU: $(nproc) cores ==="
           grep -c -E '(vmx|svm)' /proc/cpuinfo || echo "No hardware virt flags"
           echo "=== Memory ==="
           free -h
           echo "=== KVM ==="
           ls -la /dev/kvm 2>/dev/null || echo "/dev/kvm not found"
-          echo "=== Kernel ==="
-          uname -r
+          echo "=== Kernel: $(uname -r) ==="
 
       - name: Enable KVM access
-        run: |
-          sudo chmod 666 /dev/kvm
-          ls -la /dev/kvm
+        run: sudo chmod 666 /dev/kvm
 
       - name: Install QEMU and dependencies
         run: |
@@ -32,89 +28,87 @@ jobs:
 
       - name: Download cloud image
         run: |
-          # Use FULL cloud image (not minimal) - has linux-modules-extra with nvme support
           wget -q https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
           qemu-img resize ubuntu-24.04-server-cloudimg-amd64.img 8G
 
-      - name: Create cloud-init config
+      - name: Create test script and cloud-init
         run: |
-          cat > user-data <<'USERDATA'
+          # Write the test script separately to avoid YAML escaping issues
+          cat > test-nvmeof.sh <<'SCRIPT'
+          #!/bin/bash
+          set -ex
+          exec > /dev/ttyS0 2>&1
+
+          echo "=== Installing nvme-cli ==="
+          apt-get update -qq
+          apt-get install -y -qq nvme-cli
+
+          echo "=== Loading NVMe modules ==="
+          modprobe configfs
+          modprobe nvme
+          modprobe nvme-tcp
+          modprobe nvmet
+          modprobe nvmet-tcp
+          lsmod | grep nvme
+
+          echo "=== Setting up NVMe-oF loopback target ==="
+          mount -t configfs none /sys/kernel/config 2>/dev/null || true
+          truncate -s 100M /tmp/nvme-target.img
+
+          mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys
+          echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/attr_allow_any_host
+          mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1
+          echo "/tmp/nvme-target.img" > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/device_path
+          echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/enable
+
+          mkdir -p /sys/kernel/config/nvmet/ports/1
+          echo 127.0.0.1 > /sys/kernel/config/nvmet/ports/1/addr_traddr
+          echo 4420 > /sys/kernel/config/nvmet/ports/1/addr_trsvcid
+          echo tcp > /sys/kernel/config/nvmet/ports/1/addr_trtype
+          echo ipv4 > /sys/kernel/config/nvmet/ports/1/addr_adrfam
+          ln -s /sys/kernel/config/nvmet/subsystems/test-subsys /sys/kernel/config/nvmet/ports/1/subsystems/test-subsys
+
+          echo "=== Connecting as NVMe-oF initiator ==="
+          nvme discover -t tcp -a 127.0.0.1 -s 4420
+          nvme connect -t tcp -n test-subsys -a 127.0.0.1 -s 4420
+          sleep 2
+
+          echo "=== NVMe devices ==="
+          nvme list
+          lsblk
+
+          if [ ! -b /dev/nvme0n1 ]; then
+            echo "NVMEOF_RESULT=FAIL - /dev/nvme0n1 not found"
+            echo "DONE"
+            exit 1
+          fi
+
+          echo "=== Formatting and mounting ==="
+          mkfs.ext4 -F /dev/nvme0n1
+          mkdir -p /mnt/nvme
+          mount /dev/nvme0n1 /mnt/nvme
+          echo "hello from nvme-of" > /mnt/nvme/test.txt
+          cat /mnt/nvme/test.txt
+          df -h /mnt/nvme
+
+          echo "NVMEOF_RESULT=SUCCESS"
+          echo "DONE"
+          SCRIPT
+
+          # Encode script as base64 for safe embedding in cloud-init
+          B64_SCRIPT=$(base64 -w0 test-nvmeof.sh)
+
+          cat > user-data <<EOF
           #cloud-config
           password: test1234
-          chpasswd: { expire: False }
-          ssh_pwauth: True
-          write_files:
-            - path: /root/test-nvmeof.sh
-              permissions: '0755'
-              content: |
-                #!/bin/bash
-                set -ex
-
-                exec > /dev/ttyS0 2>&1
-
-                echo "=== Installing packages ==="
-                apt-get update -qq
-                apt-get install -y -qq nvme-cli
-
-                echo "=== Loading NVMe modules ==="
-                modprobe configfs
-                modprobe nvme
-                modprobe nvme-tcp
-                modprobe nvmet
-                modprobe nvmet-tcp
-                lsmod | grep nvme
-
-                echo "=== Setting up NVMe-oF loopback target ==="
-                # Mount configfs if not mounted
-                mount -t configfs none /sys/kernel/config 2>/dev/null || true
-
-                # Create backing file
-                truncate -s 100M /tmp/nvme-target.img
-
-                # Configure target subsystem
-                mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys
-                echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/attr_allow_any_host
-                mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1
-                echo "/tmp/nvme-target.img" > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/device_path
-                echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/enable
-
-                # Create TCP port
-                mkdir -p /sys/kernel/config/nvmet/ports/1
-                echo 127.0.0.1 > /sys/kernel/config/nvmet/ports/1/addr_traddr
-                echo 4420 > /sys/kernel/config/nvmet/ports/1/addr_trsvcid
-                echo tcp > /sys/kernel/config/nvmet/ports/1/addr_trtype
-                echo ipv4 > /sys/kernel/config/nvmet/ports/1/addr_adrfam
-                ln -s /sys/kernel/config/nvmet/subsystems/test-subsys /sys/kernel/config/nvmet/ports/1/subsystems/test-subsys
-
-                echo "=== Connecting as NVMe-oF initiator ==="
-                nvme discover -t tcp -a 127.0.0.1 -s 4420
-                nvme connect -t tcp -n test-subsys -a 127.0.0.1 -s 4420
-                sleep 2
-
-                echo "=== NVMe devices ==="
-                nvme list
-                lsblk
-
-                # Verify /dev/nvme0n1 exists
-                if [ ! -b /dev/nvme0n1 ]; then
-                  echo "NVMEOF_RESULT=FAIL - /dev/nvme0n1 not found"
-                  echo "DONE"
-                  exit 1
-                fi
-
-                echo "=== Formatting and mounting ==="
-                mkfs.ext4 -F /dev/nvme0n1
-                mkdir -p /mnt/nvme
-                mount /dev/nvme0n1 /mnt/nvme
-                echo "hello from nvme-of" > /mnt/nvme/test.txt
-                cat /mnt/nvme/test.txt
-                df -h /mnt/nvme
-
-                echo "NVMEOF_RESULT=SUCCESS"
-                echo "DONE"
+          chpasswd:
+            expire: false
           runcmd:
+            - echo "$B64_SCRIPT" | base64 -d > /root/test-nvmeof.sh
+            - chmod +x /root/test-nvmeof.sh
             - /root/test-nvmeof.sh
-          USERDATA
+          EOF
+
           cloud-localds seed.img user-data
 
       - name: Boot QEMU VM and test NVMe-oF
