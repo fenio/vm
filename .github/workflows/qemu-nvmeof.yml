@@ -98,19 +98,25 @@ jobs:
           # Encode script as base64 for safe embedding in cloud-init
           B64_SCRIPT=$(base64 -w0 test-nvmeof.sh)
 
-          # Note: heredoc content must not be indented - cloud-init requires #cloud-config at column 0
-          cat > user-data <<EOF
-          #cloud-config
-          password: test1234
-          chpasswd:
-            expire: false
-          runcmd:
-            - echo "$B64_SCRIPT" | base64 -d > /root/test-nvmeof.sh
-            - chmod +x /root/test-nvmeof.sh
-            - /root/test-nvmeof.sh
-          EOF
-          # Strip leading whitespace from each line (the YAML indentation gets baked into heredoc)
-          sed -i 's/^          //' user-data
+          # Write cloud-init user-data with proper YAML (no leading whitespace)
+          python3 -c "
+          import yaml, sys
+          config = {
+              'password': 'test1234',
+              'chpasswd': {'expire': False},
+              'runcmd': [
+                  'echo $B64_SCRIPT | base64 -d > /root/test-nvmeof.sh',
+                  'chmod +x /root/test-nvmeof.sh',
+                  '/root/test-nvmeof.sh',
+              ]
+          }
+          sys.stdout.write('#cloud-config\n')
+          yaml.dump(config, sys.stdout, default_flow_style=False)
+          " > user-data
+
+          echo "=== Generated user-data ==="
+          cat user-data
+          echo "==========================="
 
           cloud-localds seed.img user-data
 
