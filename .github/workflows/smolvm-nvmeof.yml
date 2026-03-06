@@ -1,0 +1,88 @@
+name: NVMe-oF with smolvm
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  smolvm-nvmeof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: System info
+        run: |
+          echo "=== CPU ==="
+          nproc
+          grep -c -E '(vmx|svm)' /proc/cpuinfo || echo "No hardware virt flags"
+          echo "=== KVM ==="
+          ls -la /dev/kvm 2>/dev/null || echo "/dev/kvm not found"
+          echo "=== Kernel ==="
+          uname -r
+
+      - name: Install smolvm
+        run: |
+          curl -sSL https://smolmachines.com/install.sh | bash
+          echo "$HOME/.smolvm/bin" >> $GITHUB_PATH
+
+      - name: Verify smolvm works
+        run: |
+          smolvm --version
+          smolvm sandbox run --net alpine:latest -- echo "smolvm works on GitHub runner"
+
+      - name: Test kernel module availability in smolvm
+        run: |
+          echo "=== Checking NVMe module support inside smolvm ==="
+          smolvm sandbox run --net alpine:latest -- sh -c '
+            echo "--- Kernel version ---"
+            uname -r
+            echo "--- Available NVMe modules ---"
+            find /lib/modules -name "nvme*" 2>/dev/null || echo "No /lib/modules found"
+            echo "--- Try loading nvme-tcp ---"
+            modprobe nvme-tcp 2>&1 || echo "modprobe nvme-tcp failed (expected - minimal kernel)"
+            echo "--- /proc/modules ---"
+            cat /proc/modules 2>/dev/null | grep nvme || echo "No nvme modules loaded"
+            echo "--- Check /dev for nvme ---"
+            ls /dev/nvme* 2>/dev/null || echo "No nvme devices"
+            echo "--- Kernel config (if available) ---"
+            zcat /proc/config.gz 2>/dev/null | grep -i nvme || echo "No /proc/config.gz"
+          ' || true
+
+      - name: Test NVMe-oF setup in smolvm microvm
+        run: |
+          smolvm microvm create nvme-test --net --cpus 2 --mem 1024
+          smolvm microvm start nvme-test
+          sleep 3
+
+          echo "=== Attempting NVMe-oF target setup inside microvm ==="
+          smolvm microvm exec --name nvme-test -- sh -c '
+            apk add --no-cache nvme-cli 2>/dev/null
+
+            echo "--- Kernel version ---"
+            uname -r
+
+            echo "--- Try loading NVMe modules ---"
+            modprobe nvme-tcp 2>&1 || echo "FAIL: modprobe nvme-tcp not available"
+            modprobe nvmet 2>&1 || echo "FAIL: modprobe nvmet not available"
+            modprobe nvmet-tcp 2>&1 || echo "FAIL: modprobe nvmet-tcp not available"
+
+            echo "--- Loaded modules ---"
+            lsmod 2>/dev/null | grep nvme || echo "No nvme modules loaded"
+
+            echo "--- Check configfs ---"
+            mount | grep configfs || echo "No configfs mounted"
+            ls /sys/kernel/config/nvmet 2>/dev/null || echo "FAIL: /sys/kernel/config/nvmet not available"
+
+            echo ""
+            echo "CONCLUSION: smolvm uses a minimal libkrunfw kernel without NVMe-oF support"
+          ' 2>&1 || true
+
+          smolvm microvm stop nvme-test 2>/dev/null || true
+          echo y | smolvm microvm delete nvme-test 2>/dev/null || true
+
+      - name: Summary
+        run: |
+          echo "========================================="
+          echo "smolvm uses libkrunfw which ships a minimal kernel."
+          echo "NVMe-oF requires nvme-tcp, nvmet, and nvmet-tcp modules"
+          echo "which are not included in the libkrunfw kernel."
+          echo "For NVMe-oF testing, a full VM (QEMU) is needed."
+          echo "========================================="

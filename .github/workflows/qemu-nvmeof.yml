@@ -1,0 +1,133 @@
+name: NVMe-oF with QEMU
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  qemu-nvmeof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: System info
+        run: |
+          echo "=== CPU ==="
+          nproc
+          grep -c -E '(vmx|svm)' /proc/cpuinfo || echo "No hardware virt flags"
+          echo "=== Memory ==="
+          free -h
+          echo "=== KVM ==="
+          ls -la /dev/kvm 2>/dev/null || echo "/dev/kvm not found"
+          echo "=== Kernel ==="
+          uname -r
+          echo "=== NVMe modules on host ==="
+          modprobe nvme-tcp 2>&1 || true
+          lsmod | grep nvme || echo "No nvme modules loaded"
+
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils wget
+
+      - name: Download cloud image
+        run: |
+          wget -q https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64.img
+          qemu-img resize ubuntu-22.04-minimal-cloudimg-amd64.img 4G
+
+      - name: Create cloud-init config
+        run: |
+          cat > user-data <<'EOF'
+          #cloud-config
+          password: test1234
+          chpasswd: { expire: False }
+          ssh_pwauth: True
+          packages:
+            - nvme-cli
+            - linux-modules-extra-$(uname -r)
+          runcmd:
+            - modprobe nvme-tcp
+            - modprobe nvmet
+            - modprobe nvmet-tcp
+            - echo "=== NVMe modules ===" > /dev/ttyS0
+            - lsmod | grep nvme > /dev/ttyS0 2>&1
+            - echo "=== Creating NVMe-oF loopback target ===" > /dev/ttyS0
+            # Create a backing file for the NVMe namespace
+            - truncate -s 100M /tmp/nvme-target.img
+            # Configure NVMe-oF target
+            - mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys
+            - echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/attr_allow_any_host
+            - mkdir -p /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1
+            - echo "/tmp/nvme-target.img" > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/device_path
+            - echo 1 > /sys/kernel/config/nvmet/subsystems/test-subsys/namespaces/1/enable
+            # Create TCP port
+            - mkdir -p /sys/kernel/config/nvmet/ports/1
+            - echo 127.0.0.1 > /sys/kernel/config/nvmet/ports/1/addr_traddr
+            - echo 4420 > /sys/kernel/config/nvmet/ports/1/addr_trsvcid
+            - echo tcp > /sys/kernel/config/nvmet/ports/1/addr_trtype
+            - echo ipv4 > /sys/kernel/config/nvmet/ports/1/addr_adrfam
+            - ln -s /sys/kernel/config/nvmet/subsystems/test-subsys /sys/kernel/config/nvmet/ports/1/subsystems/test-subsys
+            - echo "=== Target configured ===" > /dev/ttyS0
+            # Discover and connect as initiator
+            - nvme discover -t tcp -a 127.0.0.1 -s 4420 > /dev/ttyS0 2>&1
+            - nvme connect -t tcp -n test-subsys -a 127.0.0.1 -s 4420 > /dev/ttyS0 2>&1
+            - sleep 2
+            - echo "=== NVMe devices ===" > /dev/ttyS0
+            - nvme list > /dev/ttyS0 2>&1
+            - lsblk > /dev/ttyS0 2>&1
+            # Try to create filesystem and mount
+            - mkfs.ext4 -F /dev/nvme0n1 > /dev/ttyS0 2>&1
+            - mkdir -p /mnt/nvme
+            - mount /dev/nvme0n1 /mnt/nvme > /dev/ttyS0 2>&1
+            - echo "hello from nvme-of" > /mnt/nvme/test.txt
+            - cat /mnt/nvme/test.txt > /dev/ttyS0 2>&1
+            - df -h /mnt/nvme > /dev/ttyS0 2>&1
+            - echo "=== SUCCESS ===" > /dev/ttyS0
+            - echo "DONE" > /dev/ttyS0
+          EOF
+          cloud-localds seed.img user-data
+
+      - name: Boot QEMU VM and test NVMe-oF
+        timeout-minutes: 8
+        run: |
+          # Boot VM with KVM acceleration, capture serial output
+          timeout 300 qemu-system-x86_64 \
+            -enable-kvm \
+            -m 2048 \
+            -smp 2 \
+            -cpu host \
+            -nographic \
+            -serial mon:stdio \
+            -drive file=ubuntu-22.04-minimal-cloudimg-amd64.img,format=qcow2,if=virtio \
+            -drive file=seed.img,format=raw,if=virtio \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            2>&1 | tee vm-output.log &
+
+          VM_PID=$!
+
+          # Wait for the VM to finish its cloud-init and NVMe-oF test
+          for i in $(seq 1 60); do
+            if grep -q "DONE" vm-output.log 2>/dev/null; then
+              echo "VM finished NVMe-oF test"
+              break
+            fi
+            sleep 5
+          done
+
+          kill $VM_PID 2>/dev/null || true
+          wait $VM_PID 2>/dev/null || true
+
+          echo ""
+          echo "========================================="
+          echo "=== VM Serial Output ==="
+          echo "========================================="
+          cat vm-output.log
+
+          # Check results
+          if grep -q "SUCCESS" vm-output.log; then
+            echo ""
+            echo "NVMe-oF mount test PASSED inside QEMU VM"
+          else
+            echo ""
+            echo "NVMe-oF mount test FAILED or did not complete"
+            exit 1
+          fi
